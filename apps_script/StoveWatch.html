@@ -1,0 +1,249 @@
+<!doctype html>
+<html>
+  <head>
+    <base target="_top">
+    <style>
+      body { font-family: Arial, sans-serif; padding: 12px; }
+      button { margin: 6px 6px 6px 0; padding: 8px 12px; }
+      #status { margin-top: 10px; font-size: 12px; white-space: pre-wrap; }
+
+      .row { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
+      .arrowWrap { width: 80px; height: 80px; display: grid; place-items: center; }
+      .arrowSvg { width: 70px; height: 70px; transform-origin: 50% 50%; }
+
+      /* Ensure the text column can shrink/wrap in flex layout */
+      .row > div:last-child { flex: 1; min-width: 0; }
+
+      .big { font-size: 18px; font-weight: 600; }
+      .small { font-size: 12px; opacity: 0.9; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    </style>
+  </head>
+
+  <body>
+    <div>
+      <button onclick="start()">Start (10s)</button>
+      <button onclick="stop()">Stop</button>
+      <button onclick="clearLog()">Clear</button>
+      <button onclick="markLoad()">Mark Load</button>
+    </div>
+
+    <div class="row">
+      <div class="arrowWrap">
+        <svg id="arrow" class="arrowSvg" viewBox="0 0 100 100" aria-label="trend arrow">
+          <rect x="47" y="18" width="6" height="58" rx="3"></rect>
+          <polygon points="50,8 65,28 35,28"></polygon>
+        </svg>
+      </div>
+
+      <div>
+        <div class="big mono" id="tempLine">--.- °F</div>
+        <div class="small mono" id="rateLine">rate: --.- °F/min</div>
+        <div class="small mono" id="ageLine">age: -- s | fault: --</div>
+        <div class="small mono" id="loadLine">last load: (unknown)</div>
+      </div>
+    </div>
+
+    <div id="status">Idle.</div>
+
+    <script>
+      // ---------- State ----------
+      let timer = null;
+
+      // last 5 samples for slope
+      const RATE_WINDOW_SAMPLES = 5;
+      let samples = []; // {ts, tempF}
+      let lastRate = 0;
+
+      // for logging events
+      let lastTempShown = null;
+      let lastRateShown = null;
+
+      // local storage for last load
+      const LS_LAST_LOAD_KEY = "stove_last_load_ts";
+
+      // arrow scaling
+      const MAX_RATE_F_PER_MIN = 8.0;
+
+      // ---------- Helpers ----------
+      function setStatus(msg) {
+        document.getElementById('status').textContent = msg;
+      }
+
+      function minutesSince(tsMs) {
+        return (Date.now() - tsMs) / 60000.0;
+      }
+
+      function getLastLoadTs() {
+        const v = Number(localStorage.getItem(LS_LAST_LOAD_KEY) || 0);
+        return v > 0 ? v : null;
+      }
+
+      function setLastLoadTs(tsMs) {
+        localStorage.setItem(LS_LAST_LOAD_KEY, String(tsMs));
+      }
+
+      function updateLoadLine() {
+        const lastLoad = getLastLoadTs();
+        document.getElementById('loadLine').textContent =
+          lastLoad ? `last load: ${Math.round(minutesSince(lastLoad))} min ago` : `last load: (unknown)`;
+      }
+
+      // Map rate -> normalized [-1..1]
+      function normRate(rate) {
+        if (!isFinite(rate)) return 0;
+        const n = rate / MAX_RATE_F_PER_MIN;
+        return Math.max(-1, Math.min(1, n));
+      }
+
+      // normalized +1 => up (0deg), 0 => right (90deg), -1 => down (180deg)
+      function rateToAngleDeg(n) {
+        return 90 - 90 * n;
+      }
+
+      // Color mapping: blue (-1) <-> orange (+1)
+      function rateToColor(n) {
+        const t = (n + 1) / 2;
+        const b = {r: 30,  g:144, b:255}; // blue
+        const o = {r:255,  g:140, b:  0}; // orange
+        const r = Math.round(b.r + (o.r - b.r) * t);
+        const g = Math.round(b.g + (o.g - b.g) * t);
+        const bb= Math.round(b.b + (o.b - b.b) * t);
+        return `rgb(${r},${g},${bb})`;
+      }
+
+      function updateArrow(rateFPerMin) {
+        const n = normRate(rateFPerMin);
+        const angle = rateToAngleDeg(n);
+        const color = rateToColor(n);
+
+        const arrow = document.getElementById('arrow');
+        arrow.style.transform = `rotate(${angle}deg)`;
+        arrow.style.fill = color;
+      }
+
+      // Smooth the displayed rate
+      function smoothRate(newRate) {
+        const alpha = 0.35;
+        lastRate = (lastRate == null) ? newRate : (alpha * newRate + (1 - alpha) * lastRate);
+        return lastRate;
+      }
+
+      function computeSlopeFPerMin(samplesArr) {
+        // Linear regression slope of tempF vs time (minutes)
+        if (!samplesArr || samplesArr.length < 2) return 0;
+
+        const t0 = samplesArr[0].ts;
+        const pts = samplesArr
+          .filter(p => p && typeof p.ts === 'number' && typeof p.tempF === 'number')
+          .map(p => ({ x: (p.ts - t0) / 60000.0, y: p.tempF }));
+
+        if (pts.length < 2) return 0;
+
+        const xs = pts.map(p => p.x);
+        const xSpan = Math.max(...xs) - Math.min(...xs);
+        if (xSpan <= 0) return 0;
+
+        const n = pts.length;
+        const meanX = pts.reduce((s, p) => s + p.x, 0) / n;
+        const meanY = pts.reduce((s, p) => s + p.y, 0) / n;
+
+        let num = 0;
+        let den = 0;
+        for (const p of pts) {
+          const dx = p.x - meanX;
+          num += dx * (p.y - meanY);
+          den += dx * dx;
+        }
+        if (den === 0) return 0;
+
+        return num / den; // °F/min
+      }
+
+      // ---------- Actions ----------
+      function markLoad() {
+        setLastLoadTs(Date.now());
+        updateLoadLine();
+        setStatus("Marked load time.");
+        // Optional durable event log (still supported by Code.gs)
+        google.script.run
+          .withFailureHandler(err => setStatus("Log event failed: " + err.message))
+          .stoveLogEvent("LOAD", "", lastTempShown, lastRateShown, "");
+      }
+
+      // ---------- Main tick ----------
+      function tick() {
+        google.script.run
+          .withSuccessHandler((res) => {
+            if (!res || !res.ok) {
+              setStatus((res && res.message) ? res.message : "No response.");
+              return;
+            }
+
+            const ts = res.ts_ms;
+            const tempF = res.stove_F;
+
+            if (typeof ts === 'number' && typeof tempF === 'number') {
+              const last = samples.length ? samples[samples.length - 1] : null;
+              if (!last || last.ts !== ts) {
+                samples.push({ ts, tempF });
+                while (samples.length > RATE_WINDOW_SAMPLES) samples.shift();
+              }
+            }
+
+            let rate = computeSlopeFPerMin(samples);
+            rate = smoothRate(rate);
+
+            lastTempShown = tempF;
+            lastRateShown = rate;
+
+            updateArrow(rate);
+
+            document.getElementById('tempLine').textContent = `${tempF.toFixed(1)} °F`;
+            document.getElementById('rateLine').textContent = `rate: ${rate.toFixed(2)} °F/min`;
+            document.getElementById('ageLine').textContent = `age: ${res.age_s} s | fault: ${res.fault}`;
+
+            updateLoadLine();
+            setStatus("Updated.");
+          })
+          .withFailureHandler((err) => setStatus("Error: " + err.message))
+          .stoveWatchAppendLatest();
+      }
+
+      function start() {
+        if (timer) return;
+        tick();
+        timer = setInterval(tick, 10000);
+        setStatus("Running (every 10 seconds)…");
+      }
+
+      function stop() {
+        if (!timer) return;
+        clearInterval(timer);
+        timer = null;
+        setStatus("Stopped.");
+      }
+
+      function clearLog() {
+        google.script.run
+          .withSuccessHandler(() => {
+            samples = [];
+            lastRate = 0;
+            updateArrow(0);
+
+            document.getElementById('tempLine').textContent = `--.- °F`;
+            document.getElementById('rateLine').textContent = `rate: --.- °F/min`;
+            document.getElementById('ageLine').textContent = `age: -- s | fault: --`;
+            updateLoadLine();
+            setStatus("Cleared stove_watch.");
+          })
+          .withFailureHandler((err) => setStatus("Error: " + err.message))
+          .stoveWatchClear();
+      }
+
+      // ---------- Init ----------
+      updateArrow(0);
+      updateLoadLine();
+    </script>
+  </body>
+</html>
